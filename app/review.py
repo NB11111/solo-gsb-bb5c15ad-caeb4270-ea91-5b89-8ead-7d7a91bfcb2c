@@ -76,6 +76,42 @@ class ReviewResult:
 
 
 # ---------------------------------------------------------------------------
+# 公共校验与断档判定（越限复盘与热暴露核算共用）
+# ---------------------------------------------------------------------------
+
+
+def prepare_readings(
+    readings: list[tuple[datetime, float]],
+    limit: float,
+    max_sample_gap_seconds: float,
+) -> list[Reading]:
+    """校验公共参数并解析读数。
+
+    - 温度上限必须是有限数值；
+    - 最大采样间隔必须为正数；
+    - 至少需要 2 条读数，且温度均为有限数值（拒绝 NaN/Infinity）。
+
+    调用方需保证读数时间带时区且严格递增（API 层由 schema 校验）。
+    """
+    if not _is_finite(limit):
+        raise ReviewError("温度上限必须是有限数值")
+    if max_sample_gap_seconds <= 0:
+        raise ReviewError("最大采样间隔必须为正数")
+    if len(readings) < 2:
+        raise ReviewError("至少需要 2 条读数")
+    pts = [Reading(_ts(t), float(temp)) for t, temp in readings]
+    for p in pts:
+        if not _is_finite(p.temp):
+            raise ReviewError("温度读数必须是有限数值（不接受 NaN/Infinity）")
+    return pts
+
+
+def is_sample_gap(a: Reading, b: Reading, max_sample_gap_seconds: float) -> bool:
+    """相邻读数是否构成采样断档：间隔严格超过阈值（恰好等于不算）。"""
+    return b.time - a.time - max_sample_gap_seconds > _EPS
+
+
+# ---------------------------------------------------------------------------
 # 区间工具
 # ---------------------------------------------------------------------------
 
@@ -210,19 +246,9 @@ def review(
     ReviewError: 参数非法或时段无效。
     ValueError: 时间缺少时区信息。
     """
-    if not _is_finite(limit):
-        raise ReviewError("温度上限必须是有限数值")
-    if max_sample_gap_seconds <= 0:
-        raise ReviewError("最大采样间隔必须为正数")
     if min_alarm_seconds < 0:
         raise ReviewError("最短报警时长不能为负数")
-    if len(readings) < 2:
-        raise ReviewError("至少需要 2 条读数才能复盘")
-
-    pts = [Reading(_ts(t), float(temp)) for t, temp in readings]
-    for p in pts:
-        if not _is_finite(p.temp):
-            raise ReviewError("温度读数必须是有限数值（不接受 NaN/Infinity）")
+    pts = prepare_readings(readings, limit, max_sample_gap_seconds)
 
     raw_ex: list[Interval] = []
     for start, end in exemptions or []:
@@ -236,8 +262,7 @@ def review(
     over_segments: list[OverSegment] = []
 
     for a, b in zip(pts, pts[1:]):
-        gap = b.time - a.time
-        if gap - max_sample_gap_seconds > _EPS:
+        if is_sample_gap(a, b, max_sample_gap_seconds):
             # 采样断档：状态未知，不插值、不跨越。
             unknown.append(Interval(a.time, b.time))
             continue
