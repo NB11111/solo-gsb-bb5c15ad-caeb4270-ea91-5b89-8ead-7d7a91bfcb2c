@@ -1,6 +1,6 @@
-"""冷库温度越限复盘核心算法。
+"""冷库温度越限复盘与热暴露评估核心算法。
 
-处理流程：
+越限复盘（:func:`review`）：
 1. 校验参数（上限、最大采样间隔、最短报警时长必须合理；豁免时段必须有效）。
 2. 相邻且时间差不超过 ``max_sample_gap_seconds`` 的读数之间线性插值；
    时间差超过该阈值的视为"采样断档"——断档区间状态未知，越限区间不跨越断档。
@@ -8,11 +8,15 @@
 4. 从越限区间中扣除维护豁免时段（重叠部分不参与报警计时）。
 5. 扣减后的各段时长 >= ``min_alarm_seconds`` 才作为报警输出。
 
+热暴露评估（:func:`exposure`）：复用同一套读数校验与断档规则，在货物存放
+窗口内对 max(温度-上限, 0) 做精确积分并与预算比较，不扣维护豁免。
+
 所有时间一律用带时区的 ``datetime``（内部统一为 UTC，秒以 float 表示）。
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -255,6 +259,170 @@ def review(
         exceed_intervals=exceed,
         alarm_intervals=alarms,
         unknown_intervals=unknown,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 热暴露评估（℃·秒 积分）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ExposureResult:
+    known_exposure: float = 0.0
+    """窗口内已知热暴露量（℃·秒），仅统计有效采样段。"""
+
+    unknown_seconds: float = 0.0
+    """窗口内采样断档（状态未知）的秒数。"""
+
+    budget_reached_at: float | None = None
+    """已知累计量首次达到预算的时刻（POSIX 秒，段内精确求解），未达到为 None。"""
+
+    status: str = "within"
+    """exceeded=已知量达到预算；indeterminate=未达且窗口内有未知时长；within=未达且无未知。"""
+
+
+def _exposure_pieces(
+    a: Reading, b: Reading, limit: float, lo: float, hi: float
+) -> list[tuple[float, float, float, float]]:
+    """把有效采样段与窗口的重叠部分 [lo, hi] 按折点切分。
+
+    每段子区间上 f(t) = max(T(t) - limit, 0) 是线性的（折点即温度等于上限的
+    插值穿越点，至多一个），返回 [(p_lo, p_hi, f(p_lo), f(p_hi)), ...]，
+    各子段用梯形公式积分即为精确值。
+    """
+    span = b.time - a.time
+    points = [lo, hi]
+    if b.temp != a.temp:
+        t_cross = a.time + (limit - a.temp) * span / (b.temp - a.temp)
+        if lo + _EPS < t_cross < hi - _EPS:
+            points.append(t_cross)
+    points.sort()
+
+    def f_at(t: float) -> float:
+        temp = a.temp + (b.temp - a.temp) * (t - a.time) / span
+        return max(temp - limit, 0.0)
+
+    pieces: list[tuple[float, float, float, float]] = []
+    for p_lo, p_hi in zip(points, points[1:]):
+        if p_hi - p_lo <= _EPS:
+            continue
+        pieces.append((p_lo, p_hi, f_at(p_lo), f_at(p_hi)))
+    return pieces
+
+
+def _solve_reach_time(
+    p_lo: float, p_hi: float, f_lo: float, f_hi: float, remaining: float
+) -> float:
+    """在 f 线性的子段内，求从 p_lo 起再累计 remaining（℃·秒）的精确时刻。
+
+    调用方需保证 remaining 不超过该子段的完整积分；结果恒落在 [p_lo, p_hi]
+    内（在段内求解，不会"进位"到下一个采样点）。
+    """
+    length = p_hi - p_lo
+    if remaining <= 0.0:
+        return p_lo
+    slope = (f_hi - f_lo) / length  # f 的斜率（℃/秒）
+    if abs(slope) <= _EPS:
+        # f 恒定（此时必为正，否则积分不足，调用方不会进入此分支）。
+        dt = remaining / f_lo if f_lo > 0.0 else length
+    else:
+        # f_lo·dt + slope·dt²/2 = remaining，取落在子段内的根。
+        disc = max(f_lo * f_lo + 2.0 * slope * remaining, 0.0)
+        dt = (math.sqrt(disc) - f_lo) / slope
+    # 数值误差兜底：钳制在子段内。
+    return p_lo + min(max(dt, 0.0), length)
+
+
+def exposure(
+    readings: list[tuple[datetime, float]],
+    limit: float,
+    max_sample_gap_seconds: float,
+    window: tuple[datetime, datetime],
+    budget_celsius_seconds: float,
+) -> ExposureResult:
+    """评估货物存放窗口内的热暴露（复用与 :func:`review` 相同的校验与断档规则）。
+
+    参数
+    ----
+    readings / limit / max_sample_gap_seconds:
+        含义与 :func:`review` 相同。
+    window:
+        货物存放窗口 ``(开始, 结束)``，半开区间 [start, end)，必须非空且
+        位于首末读数时间之间。
+    budget_celsius_seconds:
+        正数热暴露预算（℃·秒）。
+
+    规则
+    ----
+    - 仅在有效采样段内线性插值；段裁剪到窗口后精确积分 max(温度-上限, 0)，
+      跨段累计；
+    - 采样断档不插值、不贡献已知量，但不清零已累计的已知量；
+    - 不扣减任何维护豁免。
+
+    异常
+    ----
+    ReviewError: 参数非法或窗口无效。
+    ValueError: 时间缺少时区信息。
+    """
+    if not _is_finite(limit):
+        raise ReviewError("温度上限必须是有限数值")
+    if max_sample_gap_seconds <= 0:
+        raise ReviewError("最大采样间隔必须为正数")
+    if not _is_finite(budget_celsius_seconds) or budget_celsius_seconds <= 0:
+        raise ReviewError("热暴露预算必须为正的有限数值")
+    if len(readings) < 2:
+        raise ReviewError("至少需要 2 条读数才能评估热暴露")
+
+    pts = [Reading(_ts(t), float(temp)) for t, temp in readings]
+    for p in pts:
+        if not _is_finite(p.temp):
+            raise ReviewError("温度读数必须是有限数值（不接受 NaN/Infinity）")
+
+    win_start, win_end = _ts(window[0]), _ts(window[1])
+    if win_end <= win_start + _EPS:
+        raise ReviewError("存放窗口必须非空（结束时间必须严格晚于开始时间）")
+    if win_start < pts[0].time - _EPS or win_end > pts[-1].time + _EPS:
+        raise ReviewError("存放窗口必须位于首末读数时间之间")
+
+    tol = 1e-9 * max(1.0, budget_celsius_seconds)  # 预算达成判定容差（℃·秒）
+    known = 0.0
+    unknown = 0.0
+    reached_at: float | None = None
+
+    for a, b in zip(pts, pts[1:]):
+        lo = max(a.time, win_start)
+        hi = min(b.time, win_end)
+        if hi <= lo + _EPS:
+            continue  # 该段与窗口无重叠
+        if b.time - a.time - max_sample_gap_seconds > _EPS:
+            # 采样断档：状态未知，不插值、不贡献已知量，但累计值不清零。
+            unknown += hi - lo
+            continue
+        for p_lo, p_hi, f_lo, f_hi in _exposure_pieces(a, b, limit, lo, hi):
+            piece = (p_hi - p_lo) * (f_lo + f_hi) / 2.0
+            if (
+                reached_at is None
+                and piece > 0.0
+                and known + piece >= budget_celsius_seconds - tol
+            ):
+                reached_at = _solve_reach_time(
+                    p_lo, p_hi, f_lo, f_hi, budget_celsius_seconds - known
+                )
+            known += piece
+
+    if reached_at is not None:
+        status = "exceeded"
+    elif unknown > _EPS:
+        status = "indeterminate"
+    else:
+        status = "within"
+
+    return ExposureResult(
+        known_exposure=known,
+        unknown_seconds=unknown,
+        budget_reached_at=reached_at,
+        status=status,
     )
 
 

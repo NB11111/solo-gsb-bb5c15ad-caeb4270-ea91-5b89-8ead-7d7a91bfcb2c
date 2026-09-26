@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -15,7 +16,7 @@ class TemperatureReading(BaseModel):
 
 
 class TimePeriod(BaseModel):
-    """一个半开时间区间 [start, end)，维护豁免时段用。"""
+    """一个半开时间区间 [start, end)，维护豁免时段、货物存放窗口共用。"""
 
     start: datetime = Field(..., description="开始时间（含），必须带时区")
     end: datetime = Field(..., description="结束时间（不含），必须带时区，且严格晚于开始时间")
@@ -27,6 +28,34 @@ class TimePeriod(BaseModel):
         if self.end <= self.start:
             raise ValueError("end 必须严格晚于 start")
         return self
+
+
+# ---------------------------------------------------------------------------
+# 共用校验（复盘与热暴露接口一致）
+# ---------------------------------------------------------------------------
+
+
+def _ensure_readings_valid(
+    value: list[TemperatureReading],
+) -> list[TemperatureReading]:
+    """读数必须全部带时区，且时间严格递增。"""
+    if not value:
+        return value
+    for item in value:
+        if item.time.tzinfo is None:
+            raise ValueError("每条读数的 time 都必须带时区")
+    prev = value[0].time
+    for item in value[1:]:
+        if item.time <= prev:
+            raise ValueError("读数时间必须严格递增")
+        prev = item.time
+    return value
+
+
+def _ensure_limit_finite(value: float) -> float:
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError("温度上限必须是有限数值")
+    return value
 
 
 class AlarmReviewRequest(BaseModel):
@@ -49,24 +78,12 @@ class AlarmReviewRequest(BaseModel):
     @field_validator("readings")
     @classmethod
     def _check_strictly_increasing(cls, value: list[TemperatureReading]):
-        if not value:
-            return value
-        for item in value:
-            if item.time.tzinfo is None:
-                raise ValueError("每条读数的 time 都必须带时区")
-        prev = value[0].time
-        for item in value[1:]:
-            if item.time <= prev:
-                raise ValueError("读数时间必须严格递增")
-            prev = item.time
-        return value
+        return _ensure_readings_valid(value)
 
     @field_validator("temperature_limit")
     @classmethod
     def _check_limit_finite(cls, value: float) -> float:
-        if value != value or value in (float("inf"), float("-inf")):
-            raise ValueError("温度上限必须是有限数值")
-        return value
+        return _ensure_limit_finite(value)
 
 
 class IntervalOut(BaseModel):
@@ -90,3 +107,61 @@ class AlarmReviewResponse(BaseModel):
     )
     alarm_count: int
     unknown_count: int
+
+
+class ExposureRequest(BaseModel):
+    """热暴露评估请求。"""
+
+    readings: list[TemperatureReading] = Field(
+        ..., min_length=2, description="同一冷库的温度读数，时间必须严格递增"
+    )
+    temperature_limit: float = Field(..., description="温度上限（°C）")
+    max_sample_gap_seconds: float = Field(
+        ..., gt=0, description="允许的最大相邻采样间隔（秒），超过即视为采样断档"
+    )
+    storage_window: TimePeriod = Field(
+        ...,
+        description="货物存放窗口 [start, end)，必须带时区、非空且位于首末读数时间之间",
+    )
+    exposure_budget_celsius_seconds: float = Field(
+        ..., gt=0, description="正数热暴露预算（℃·秒）"
+    )
+
+    @field_validator("readings")
+    @classmethod
+    def _check_strictly_increasing(cls, value: list[TemperatureReading]):
+        return _ensure_readings_valid(value)
+
+    @field_validator("temperature_limit")
+    @classmethod
+    def _check_limit_finite(cls, value: float) -> float:
+        return _ensure_limit_finite(value)
+
+    @model_validator(mode="after")
+    def _check_window_within_readings(self) -> "ExposureRequest":
+        first, last = self.readings[0].time, self.readings[-1].time
+        if self.storage_window.start < first or self.storage_window.end > last:
+            raise ValueError("存放窗口必须位于首末读数时间之间")
+        return self
+
+
+class ExposureResponse(BaseModel):
+    """热暴露评估响应。"""
+
+    status: Literal["exceeded", "indeterminate", "within"] = Field(
+        ...,
+        description=(
+            "exceeded=已知热暴露量达到预算；indeterminate=未达到且窗口内存在未知时长；"
+            "within=未达到且窗口内无未知时长"
+        ),
+    )
+    known_exposure_celsius_seconds: float = Field(
+        ..., description="窗口内已知热暴露量（℃·秒），仅统计有效采样段，不扣维护豁免"
+    )
+    unknown_seconds_in_window: float = Field(
+        ..., description="窗口内采样断档（状态未知）的秒数"
+    )
+    budget_reached_at: datetime | None = Field(
+        ...,
+        description="已知累计量首次达到预算的时刻（UTC，段内精确求解），未达到为 null",
+    )
